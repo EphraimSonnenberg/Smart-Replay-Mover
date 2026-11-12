@@ -153,6 +153,18 @@ echo -e "${CYAN}── Game Detection (X11) ──${NC}"
 install_if_missing "xprop" "$XPROP_PKG" "xprop (X11 window detection)"
 echo ""
 
+echo -e "${CYAN}── Game Detection (KDE Plasma Wayland, optional) ──${NC}"
+if command -v kdotool &>/dev/null; then
+    echo -e "  ${GREEN}✅ kdotool${NC} — already installed ($(command -v kdotool))"
+    SKIPPED=$((SKIPPED + 1))
+elif [ -n "$WAYLAND_DISPLAY" ] && [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
+    echo -e "  ${YELLOW}ℹ️  kdotool not found${NC} — native Wayland games will not be detected."
+    echo "     Install it from the AUR (kdotool) or https://github.com/jinliu/kdotool"
+else
+    echo -e "  ${GREEN}✅ kdotool${NC} — not needed (not a KDE Plasma Wayland session)"
+fi
+echo ""
+
 echo -e "${CYAN}── Notifications ──${NC}"
 install_if_missing "notify-send" "$NOTIFY_PKG" "notify-send (desktop notifications)"
 echo ""
