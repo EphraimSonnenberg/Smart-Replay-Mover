@@ -2653,7 +2653,7 @@ local IGNORE_LIST = {
     -- ═══════════════════════════════════════════════════════════════
     -- OBS & STREAMING
     -- ═══════════════════════════════════════════════════════════════
-    "obs64", "obs32", "obs", "streamlabs", "streamlabsobs",
+    "obs64", "obs32", "obs", "com.obsproject.studio", "streamlabs", "streamlabsobs",
     "xsplit", "xsplitbroadcaster", "xsplitgamecaster",
 
     -- ═══════════════════════════════════════════════════════════════
@@ -2881,7 +2881,7 @@ for _, v in ipairs(IGNORE_LIST) do IGNORE_SET[v] = true end
 do
     local core = {}
     for _, v in ipairs({
-        "obs64", "obs32", "obs",
+        "obs64", "obs32", "obs", "com.obsproject.studio",
         "explorer", "searchapp", "searchhost", "lockapp", "applicationframehost", "shellexperiencehost",
         "plasmashell", "xfdesktop", "nemo-desktop", "gnome-shell",
         "textinputhost", "dwm", "startmenuexperiencehost", "runtimebroker", "sihost",
@@ -4789,8 +4789,48 @@ function get_active_x11_window_info()
     return process, title
 end
 
+-- Native Wayland windows on KDE Plasma via kdotool (optional dependency).
+-- xprop only sees XWayland windows; KWin reports a classless placeholder otherwise.
+local function trim_output(s)
+    if not s then return nil end
+    s = s:match("^%s*(.-)%s*$")
+    if s == "" then return nil end
+    return s
+end
+
+function get_active_kwin_window_info()
+    if IS_WINDOWS or not os.getenv("WAYLAND_DISPLAY") or not command_exists("kdotool") then return nil, nil end
+    local out = capture_command_output("kdotool getactivewindow getwindowclassname getwindowname")
+    if not out then return nil, nil end
+    local class, title = out:match("^([^\n]*)\n?([^\n]*)")
+    return normalize_detected_process_name(trim_output(class)), trim_output(title)
+end
+
+-- all open KWin windows as {process, title}, for finding a game that is
+-- open but not focused (e.g. recording started from the OBS window).
+function list_kwin_windows()
+    local result = {}
+    if IS_WINDOWS or not os.getenv("WAYLAND_DISPLAY") or not command_exists("kdotool") then return result end
+    local ids = capture_command_output("kdotool search --class .")
+    if not ids then return result end
+    for id in ids:gmatch("[^\n]+") do
+        id = trim_output(id)
+        if id then
+            local q = quote_shell_arg(id)
+            local class = trim_output(capture_command_output("kdotool getwindowclassname " .. q))
+            local title = trim_output(capture_command_output("kdotool getwindowname " .. q))
+            local pid = tonumber(trim_output(capture_command_output("kdotool getwindowpid " .. q)) or "")
+            local process = normalize_detected_process_name(class)
+            if process then table.insert(result, { process = process, title = title, pid = pid }) end
+        end
+    end
+    return result
+end
+
 function get_active_linux_window_info()
     local process, title = get_active_x11_window_info()
+    if process or title then return process, title end
+    process, title = get_active_kwin_window_info()
     if process or title then return process, title end
     return nil, nil
 end
@@ -4954,6 +4994,56 @@ local function get_background_game()
     return ok and result or nil
 end
 
+-- true when Steam launched this process as a game (not the Steam client).
+local function is_steam_game_pid(pid)
+    if not pid then return false end
+    local f = io.open("/proc/" .. tostring(pid) .. "/environ", "rb")
+    if not f then return false end
+    local env = f:read("*a") or ""
+    f:close()
+    for entry in env:gmatch("[^%z]+") do
+        local key, value = entry:match("^(Steam[AG][pa][pm][Ie]d)=(.*)$")
+        if (key == "SteamAppId" or key == "SteamGameId") and value ~= "" and value ~= "0" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Linux/KWin counterpart of get_background_game, using open windows.
+local function get_background_kwin_game()
+    local found, found_title = nil, nil
+    local steam_title = nil
+    for _, w in ipairs(list_kwin_windows()) do
+        local name = string.lower(w.process)
+        -- A Steam game (generic steam_app_<AppID> class, or a process Steam launched with
+        -- SteamAppId/SteamGameId set): its title, or failing that its class, is the game name.
+        if not steam_title and not is_ignored(name)
+           and (is_generic_steam_app_identifier(name) or is_steam_game_pid(w.pid)) then
+            if w.title and w.title ~= "" then
+                steam_title = w.title
+            elseif not is_generic_steam_app_identifier(name) then
+                steam_title = w.process
+            end
+        end
+        if not is_ignored(name) and not is_generic_steam_app_identifier(name) then
+            if CUSTOM_NAMES_EXACT and CUSTOM_NAMES_EXACT[name] then
+                found, found_title = w.process, w.title
+                break
+            end
+            if not found and ((GAME_NAMES and GAME_NAMES[name]) or (GAME_DATABASE and GAME_DATABASE[name])) then
+                found, found_title = w.process, w.title
+            end
+        end
+    end
+    if found then dbg("Background game found via KWin windows: " .. found) end
+    if not found and steam_title then
+        dbg("Background Steam game found via KWin window title: " .. steam_title)
+        return steam_title, steam_title
+    end
+    return found, found_title
+end
+
 -- An exact custom rule for an ignored app means the user wants that app organized.
 local function is_ignored_without_rule(name)
     return is_ignored(name) and not CUSTOM_NAMES_EXACT[string.lower(name)]
@@ -5006,6 +5096,9 @@ local function detect_game()
         local linux_process, linux_title = get_active_linux_window_info()
         remember_program(linux_process, linux_title)
         if linux_process and is_ignored_without_rule(linux_process) then
+            -- a known game open in another window wins over the ignored app.
+            local bg_game, bg_title = get_background_kwin_game()
+            if bg_game then return bg_game, bg_title, false end
             if CONFIG.app_name_folders and not is_core_ignored(linux_process) then
                 -- As on Windows, a game that OBS is capturing wins over the app in focus.
                 local obs_game, obs_window = find_game_in_obs()
